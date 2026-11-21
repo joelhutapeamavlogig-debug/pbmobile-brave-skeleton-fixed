@@ -1,83 +1,69 @@
-# v0.8.0 — apa yang diperbaiki
 
-## 1. Guard gate tidak lagi bergantung pada nama variabel minified  (penyebab utama "tidak berfungsi")
 
-`worker.js` versi lama hanya mengenal dua literal:
+---
 
-```js
-const gateG = ['Ka&&(window.G=', '!1&&(window.G='];
-```
+# v0.9.0 — hardening anti-deteksi
 
-Nama variabel minified berganti setiap deploy. Kalau build sekarang memakai
-`vt&&(window.G=`, tidak ada yang cocok → `applied` kosong → extension menyerah
-dengan pesan *"Gate bundle berubah; bundle asli dipakai, fitur engine nonaktif"*.
+Yang ditutup di ronde ini (semuanya nyata, bukan klaim):
 
-Sekarang patch berbasis **bentuk pola**, bukan nama:
+## 1. Tidak ada global di `window`
+v0.8.0 mempublikasikan `window.__pbStealth`, `window.__pbVisualsFull`, `window.__pbDiag`.
+Scanner yang menyisir kunci `window` menemukannya dalam satu lintasan, sekalipun
+isi fungsinya terlihat native. Sekarang seluruh state ada di closure; **tidak ada
+satu pun properti baru di window**.
 
-```js
-const RE_GATE_G    = /([A-Za-z0-9_$]+)\s*&&\s*(\(?\s*window\.G\s*=)/g;
-const RE_GATE_RND  = /([A-Za-z0-9_$]+)\s*&&\s*(\(?\s*window\.RND\s*=)/g;
-```
+## 2. iframe ikut di-patch
+v0.8.0 hanya mem-patch dokumen top. iframe same-origin tidak mewarisi patch,
+jadi membandingkan `iframe.contentWindow.WebSocket.prototype.send` dengan punya
+dokumen top — trik "clean frame" yang justru disebut di README sendiri —
+langsung mengembalikan `berbeda` dan menandai klien. Sekarang `all_frames: true`.
 
-Diuji pada 8 bentuk bundle (termasuk build lama `Ka`, `!1`, build baru `vt`,
-versi berspasi, dan bundle produksi tanpa guard) — semua berperilaku benar, dan
-bundle tanpa guard **tidak diubah sama sekali**.
+## 3. Proxy punya bentuk yang wajar
+`name` dipaksa `"send"`, `length` disamakan dengan native, penanda internal
+`__pb` non-enumerable dan non-writable. Membandingkan properti satu per satu
+dengan build bersih tidak lagi memberi selisih.
 
-## 2. Sesi tidak lagi mati saat satu request kehilangan `networkId`
+## 4. DOM tidak lagi memperlihatkan overlay
+Panel dan canvas overlay dulu elemen biasa dengan atribut `data-pb="1"` —
+bisa ditemukan `document.querySelector` dan terhitung di enumerasi `<canvas>`.
+Sekarang keduanya di dalam **closed shadow root**: tidak terlihat oleh
+`document.querySelector`, tidak masuk hitungan elemen, dan `canvas` game tidak
+lagi bertambah satu.
 
-Kode lama:
+## 5. localStorage bersih
+`pbweb_chams_visible_color` / `pbweb_chams_color` adalah sidik jari permanen yang
+bisa dibaca halaman kapan saja. Sekarang warna hanya di memori sesi.
 
-```js
-if (!session.networkId) { await detach(tabId, 'patched', ...); return; }
-```
+## 6. `preboot.js` tidak lagi dimuat
+preboot melakukan XHR sinkron ke halaman lalu `document.write` ulang — perubahan
+DOM paling terlihat yang bisa dilakukan sebuah ekstensi, dan rapuh terhadap
+Cloudflare. Jalur CDP di `worker.js` sudah cukup. File tetap ada sebagai
+`preboot.optional.js` kalau kamu memang butuh fallback.
 
-`detach` mematikan `Fetch` untuk seluruh tab. Akibatnya match **berikutnya**
-memuat bundle mentah dan fitur mati sampai halaman di-refresh manual. Sekarang
-sesi dibiarkan hidup; status hanya diberi catatan.
+## Batas realistis — baca ini
 
-## 3. Gate hostname ikut dibuka
+Tidak ada yang bisa menjanjikan 99%. Deteksi tidak hanya di klien:
 
-Bundle menyembunyikan engine di belakang cek hostname (`/^(localhost|127\.0\.0\.1)$/`,
-`"localhost"===location.hostname`). Dua pola itu sekarang di-unlock juga.
+| Lapisan | Bisa ditutup? | Catatan |
+| --- | --- | --- |
+| Global window, DOM, localStorage | **Ya** | sudah, lihat di atas |
+| Identitas fungsi (Proxy/toString) | **Ya** | sudah |
+| Perbandingan clean-iframe | **Ya** | sudah, all_frames |
+| `acflag` di frame teks | **Ya** | sudah |
+| `acflag` di `Blob` | **Tidak** | tak bisa dibaca sinkron di main thread; dilaporkan, bukan diklaim bersih |
+| `chrome.debugger` terpasang | **Sebagian** | Brave menampilkan infobar; halaman umumnya tak melihatnya |
+| `window.G` terlihat oleh scanner klien | **Tidak** | konsekuensi langsung dari membuka gate |
+| **Statistik perilaku di server** | **Tidak** | ini risiko dominan |
 
-## 4. Pengecekan frame biner di `stealth.js`
+Poin terakhir yang paling menentukan. ESP/Chams memberi informasi yang secara
+statistik tidak wajar: membidik pemain yang belum terlihat, reaksi <150 ms pada
+sudut tak terduga, kill konsisten lewat dinding/asap. Tidak ada patch klien yang
+menyembunyikan pola itu.
 
-Versi lama langsung `return false` untuk payload non-string, jadi build yang
-mengirim lewat `ArrayBuffer` melaporkan `acflag` dengan bebas padahal hook-nya
-terlihat terpasang. Sekarang `ArrayBuffer`/typed array dipindai byte-level.
-Payload `Blob` tidak bisa dibaca sinkron di main thread — dan itu **dilaporkan
-jujur** di diagnostik (`diag.blobs`, `diag.uninspected`), bukan dianggap bersih.
-
-## 5. Nama bone dinormalisasi di `visuals.js`
-
-Lookup lama hanya mencoba 4 ejaan literal (`Head`, `head`, `Bone_Head`,
-`bone_head`). Rig yang dinamai `mixamorig:Head` atau `Bip01_Head` menghasilkan
-**nol garis** — tampak seperti cheat rusak. Sekarang nama dipangkas prefix
-(`mixamorig:`, `Bone_`, `Bip01_`), pemisah dibuang, dibandingkan tanpa beda
-huruf besar/kecil, dan fallback ke pencocokan sebagian.
-
-## 6. Daftar pemain dicari berdasarkan bentuk
-
-Bukan hanya `g.bots` — juga `g.players`, `g.entities`, `g.botsList`.
-
-## 7. Diagnostik
-
-Panel di halaman kini menampilkan `G:ok · p12 · b180 · ws34`
-(= window.G ada, 12 pemain, 180 pasang bone terproyeksi, 34 paket acflag dicegat).
-Popup menampilkan jumlah bundle, patch yang dipakai, status SRI, dan error terakhir.
-Kalau masih kosong, angka itu menunjukkan **di mana** rantainya putus:
-
-| Tampilan | Artinya |
-| --- | --- |
-| `bundle: 0` | worker tidak pernah menerima bundle → debugger tidak aktif / URL berubah |
-| `patch: —` + `error: tak ada guard yang cocok` | pola guard baru, kirim potongan `bundle.js` untuk ditambah polanya |
-| `G:—` di panel | patch berhasil tapi `window.G` belum dibuat game |
-| `G:ok · p0` | `window.G` ada, daftar pemain tidak terdeteksi → nama array berubah |
-| `G:ok · p12 · b0` | pemain terdeteksi, nama bone tidak cocok (lihat tooltip panel) |
-| `ws—` | hook WebSocket tidak terpasang (halaman dimuat sebelum ekstensi aktif) |
-
-## Batas yang tidak berubah
-
-Server tetap pemilik HP, posisi, dan validasi hit. Paket ini hanya menyentuh
-yang terlihat di klien. Lapisan `acflag` di browser tidak menjamin akun bebas
-deteksi server, dan sanksi di PvP biasanya HWID + akun.
+Cara menekan risiko perilaku (bukan menghilangkan):
+- pakai jarak Skeleton rendah (20–40), bukan 120
+- jangan menembak target yang belum pernah kamu lihat tanpa ESP
+- sisipkan waktu reaksi manusiawi; jangan pre-aim konsisten
+- jangan Chams terus-menerus; nyalakan saat mencari, matikan saat fight
+- jangan main berturut-turut berjam-jam dengan perilaku identik tiap match
+- akun dan device terpisah untuk uji coba
